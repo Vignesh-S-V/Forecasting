@@ -1,5 +1,3 @@
-
-
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -205,19 +203,49 @@ def load_excel(file_bytes):
     df = pd.read_excel(io.BytesIO(file_bytes))
     return df
 
+
 def find_columns(df):
-    """Auto-detect Date / Sales / SUBGRP columns (case-insensitive)."""
+    """
+    Auto-detect Date / Sales / SUBGRP columns (case-insensitive).
+    FIX: Ensures only ONE column maps to each target name,
+         preventing duplicate column names which cause df[col]
+         to return a DataFrame instead of a Series.
+    """
     col_map = {}
+    already_mapped = set()  # Track which target names are already assigned
+
     for c in df.columns:
         cl = str(c).strip().lower()
-        if cl == "date":
+
+        if cl == "date" and "Date" not in already_mapped:
             col_map[c] = "Date"
-        elif cl in ("cy value", "cyvalue", "cy_value", "sales", "value", "amount"):
+            already_mapped.add("Date")
+
+        elif cl in ("cy value", "cyvalue", "cy_value", "sales", "value", "amount") \
+                and "Sales" not in already_mapped:
             col_map[c] = "Sales"
+            already_mapped.add("Sales")
+
         elif cl in ("subgrp", "sub_grp", "sub grp", "productname",
-                    "product_name", "product name", "product", "category"):
+                    "product_name", "product name", "product", "category") \
+                and "SUBGRP" not in already_mapped:
             col_map[c] = "SUBGRP"
+            already_mapped.add("SUBGRP")
+
     return col_map
+
+
+def safe_get_series(df, col_name):
+    """
+    Safely retrieve a column as a Series.
+    If df[col_name] returns a DataFrame (due to duplicate column names),
+    take only the first column to avoid .unique() / .dropna() failures.
+    """
+    result = df[col_name]
+    if isinstance(result, pd.DataFrame):
+        result = result.iloc[:, 0]
+    return result
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 — OUTLIER DETECTION & CLEANING
@@ -262,11 +290,9 @@ def detect_and_clean_outliers(monthly_series: pd.Series, method="iqr_mad"):
     # Clean: replace outliers with linear interpolation
     y_clean = y.copy()
     for i in np.where(flags)[0]:
-        # Find nearest non-outlier neighbors
         left  = next((j for j in range(i-1, -1, -1) if not flags[j]), None)
         right = next((j for j in range(i+1, n)       if not flags[j]), None)
         if left is not None and right is not None:
-            # Linear interpolation
             t = (i - left) / (right - left)
             y_clean[i] = y[left] * (1 - t) + y[right] * t
         elif left is not None:
@@ -342,7 +368,6 @@ def sarima_simple(series, forecast_periods=6, season=12):
     y = np.array(series, dtype=float)
     n = len(y)
     if n < season + 3:
-        # Fallback: simple seasonal naive
         fc = [y[-(season - i % season)] if season - i % season <= n else y[-1]
               for i in range(forecast_periods)]
         return {"name": "SARIMA", "fitted": list(y), "forecast": fc,
@@ -375,7 +400,6 @@ def sarima_simple(series, forecast_periods=6, season=12):
         y_ext.append(max(next_y, 0))
         forecast.append(max(next_y, 0))
 
-    # Reconstruct fitted
     d2_fit, fitted = list(d2[:p]), list(y[:season + p])
     for i in range(p, len(d2)):
         d2_fit.append(ar_coef @ np.array(d2_fit[-p:])[::-1])
@@ -478,9 +502,10 @@ def build_excel(df, ens, all_models, future_dates, metrics_df, lo, hi, subgrp):
     from openpyxl.utils import get_column_letter
 
     wb = Workbook()
-    thin = Border(*[Side(style="thin")] * 0,
-                  left=Side(style="thin"), right=Side(style="thin"),
-                  top=Side(style="thin"), bottom=Side(style="thin"))
+    thin = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
+    )
 
     def hdr(cell, bg="1A2C5B"):
         cell.font      = Font(bold=True, color="FFFFFF", size=11)
@@ -554,13 +579,11 @@ def plot_main_forecast(df, models, ens, future_dates, lo, hi):
     y_cr  = df["Sales"] / 1e7
 
     fig = go.Figure()
-    # Actual
     fig.add_trace(go.Scatter(
         x=dates, y=y_cr, mode="lines+markers", name="Actual Sales",
         line=dict(color="#ffffff", width=2.5),
         marker=dict(size=6, color="#ffffff"),
     ))
-    # Individual models
     for m, c in zip(models, ACCENT):
         fig.add_trace(go.Scatter(
             x=future_dates, y=np.array(m["forecast"])/1e7,
@@ -568,7 +591,6 @@ def plot_main_forecast(df, models, ens, future_dates, lo, hi):
             line=dict(color=c, width=1.5, dash="dot"),
             marker=dict(size=5), opacity=0.75,
         ))
-    # Ensemble CI shading
     fig.add_trace(go.Scatter(
         x=list(future_dates) + list(future_dates)[::-1],
         y=list(np.array(hi)/1e7) + list(np.array(lo)/1e7)[::-1],
@@ -576,14 +598,12 @@ def plot_main_forecast(df, models, ens, future_dates, lo, hi):
         line=dict(color="rgba(255,255,255,0)"),
         hoverinfo="skip", showlegend=True, name="90% CI",
     ))
-    # Ensemble line
     fig.add_trace(go.Scatter(
         x=future_dates, y=np.array(ens["forecast"])/1e7,
         mode="lines+markers", name=f"⭐ Ensemble (MAPE {ens['mape']:.1f}%)",
         line=dict(color="#e650a0", width=3),
         marker=dict(size=9, symbol="star"),
     ))
-    # Forecast start line
     fig.add_vline(x=str(df["Date"].max()), line_dash="dash",
                   line_color="rgba(255,255,255,0.3)", line_width=1.5)
 
@@ -611,7 +631,6 @@ def plot_outliers(df_monthly_raw, df_monthly_clean, flags, dates):
         line=dict(color="#50d090", width=2.5),
         marker=dict(size=5, color="#50d090"),
     ))
-    # Highlight outlier points
     ol_dates = [d for d, f in zip(dates, flags) if f]
     ol_vals  = [v for v, f in zip(y_raw, flags) if f]
     if ol_dates:
@@ -735,19 +754,36 @@ def main():
             help="File must have: Date, CY Value, SUBGRP columns",
         )
 
-        subgrp_choice = None
+        subgrp_choice   = None
         remove_outliers = True
         forecast_periods = 6
 
         if uploaded:
             st.success("✅ File uploaded!")
             try:
-                raw_df = load_excel(uploaded.read())
+                raw_df  = load_excel(uploaded.read())
                 col_map = find_columns(raw_df)
-                raw_df_renamed = raw_df.rename(columns=col_map)
+                raw_df_renamed = raw_df.rename(columns=col_map).copy()
+
+                # ── FIX: handle duplicate column names ───────────────────
+                # After renaming, if there are still duplicate column names,
+                # keep only the FIRST occurrence of each target column.
+                seen = {}
+                new_cols = []
+                for col in raw_df_renamed.columns:
+                    if col not in seen:
+                        seen[col] = 0
+                        new_cols.append(col)
+                    else:
+                        seen[col] += 1
+                        new_cols.append(f"{col}__dup{seen[col]}")
+                raw_df_renamed.columns = new_cols
+                # ── END FIX ──────────────────────────────────────────────
 
                 if "SUBGRP" in raw_df_renamed.columns:
-                    subgrps = sorted(raw_df_renamed["SUBGRP"].dropna().unique().tolist())
+                    # safe_get_series guards against any remaining DataFrame return
+                    subgrp_series = safe_get_series(raw_df_renamed, "SUBGRP")
+                    subgrps = sorted(subgrp_series.dropna().unique().tolist())
                     subgrp_choice = st.selectbox(
                         "🏷️ Filter by SUBGRP",
                         options=["All Products"] + subgrps,
@@ -757,7 +793,7 @@ def main():
                     st.warning("⚠️ No SUBGRP column found. Using all data.")
 
                 st.markdown("---")
-                remove_outliers = st.toggle("🔍 Remove Outliers", value=True)
+                remove_outliers  = st.toggle("🔍 Remove Outliers", value=True)
                 forecast_periods = st.slider("📅 Forecast Months", 3, 12, 6)
 
                 st.markdown("---")
@@ -767,6 +803,8 @@ def main():
 
             except Exception as e:
                 st.error(f"❌ Error reading file: {e}")
+                import traceback
+                st.code(traceback.format_exc())
                 return
 
         st.markdown("---")
@@ -779,7 +817,6 @@ def main():
 
     # ── Main Content ──────────────────────────────────────────────────────────
     if uploaded is None:
-        # Welcome screen
         col1, col2, col3 = st.columns(3)
         for col, icon, title, desc in [
             (col1, "📂", "Upload", "Upload your Excel file with Date, CY Value, SUBGRP columns"),
@@ -801,7 +838,7 @@ def main():
 
     # ── Process data ──────────────────────────────────────────────────────────
     try:
-        raw_df = load_excel(uploaded.getvalue())
+        raw_df  = load_excel(uploaded.getvalue())
         col_map = find_columns(raw_df)
 
         if "Date" not in col_map.values():
@@ -812,16 +849,30 @@ def main():
             return
 
         df_work = raw_df.rename(columns=col_map).copy()
-        df_work["Date"] = pd.to_datetime(df_work["Date"], errors="coerce")
+
+        # ── FIX: deduplicate column names after rename ────────────────────
+        seen = {}
+        new_cols = []
+        for col in df_work.columns:
+            if col not in seen:
+                seen[col] = 0
+                new_cols.append(col)
+            else:
+                seen[col] += 1
+                new_cols.append(f"{col}__dup{seen[col]}")
+        df_work.columns = new_cols
+        # ── END FIX ──────────────────────────────────────────────────────
+
+        df_work["Date"]  = pd.to_datetime(safe_get_series(df_work, "Date"),  errors="coerce")
+        df_work["Sales"] = pd.to_numeric(safe_get_series(df_work, "Sales"), errors="coerce").fillna(0)
         df_work = df_work.dropna(subset=["Date", "Sales"])
-        df_work["Sales"] = pd.to_numeric(df_work["Sales"], errors="coerce").fillna(0)
 
         # Product filter
+        filter_label = "All Products"
         if subgrp_choice and subgrp_choice != "All Products" and "SUBGRP" in df_work.columns:
-            df_work = df_work[df_work["SUBGRP"] == subgrp_choice].copy()
+            subgrp_col = safe_get_series(df_work, "SUBGRP")
+            df_work = df_work[subgrp_col == subgrp_choice].copy()
             filter_label = subgrp_choice
-        else:
-            filter_label = "All Products"
 
         if len(df_work) == 0:
             st.error("❌ No data after filtering!")
@@ -854,16 +905,15 @@ def main():
         return
 
     # ── KPI Row ───────────────────────────────────────────────────────────────
-    st.markdown(f"<div class='section-header'>📊 Data Overview — {filter_label}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='section-header'>📊 Data Overview — {filter_label}</div>",
+                unsafe_allow_html=True)
 
     k1, k2, k3, k4, k5 = st.columns(5)
-    period_str = f"{df_monthly['Date'].min().strftime('%b %Y')} → {df_monthly['Date'].max().strftime('%b %Y')}"
-    avg_cr  = df_forecast["Sales"].mean() / 1e7
-    peak_cr = df_forecast["Sales"].max() / 1e7
-    peak_m  = df_forecast.loc[df_forecast["Sales"].idxmax(), "Date"].strftime("%b %Y")
-    total_cr = df_forecast["Sales"].sum() / 1e7
+    avg_cr   = df_forecast["Sales"].mean() / 1e7
+    peak_cr  = df_forecast["Sales"].max()  / 1e7
+    peak_m   = df_forecast.loc[df_forecast["Sales"].idxmax(), "Date"].strftime("%b %Y")
+    total_cr = df_forecast["Sales"].sum()  / 1e7
 
-    # YoY
     df_forecast["Year"]  = df_forecast["Date"].dt.year
     df_forecast["Month"] = df_forecast["Date"].dt.month
     y_last = df_forecast["Year"].max()
@@ -873,11 +923,14 @@ def main():
     yoy    = (s_last - s_prev) / (s_prev + 1e-9) * 100 if s_prev > 0 else 0
     yoy_sign = "🔺" if yoy > 0 else "🔻"
 
+    period_str = (f"{df_monthly['Date'].min().strftime('%b %Y')} → "
+                  f"{df_monthly['Date'].max().strftime('%b %Y')}")
+
     for col, label, val, sub in [
-        (k1, "PERIOD",     period_str, f"{len(df_monthly)} months"),
-        (k2, "AVG MONTHLY", f"₹{avg_cr:.1f} Cr", "average"),
-        (k3, "PEAK MONTH",  f"₹{peak_cr:.1f} Cr", peak_m),
-        (k4, "TOTAL",       f"₹{total_cr:.1f} Cr", "all months"),
+        (k1, "PERIOD",      period_str,              f"{len(df_monthly)} months"),
+        (k2, "AVG MONTHLY", f"₹{avg_cr:.1f} Cr",    "average"),
+        (k3, "PEAK MONTH",  f"₹{peak_cr:.1f} Cr",   peak_m),
+        (k4, "TOTAL",       f"₹{total_cr:.1f} Cr",  "all months"),
         (k5, "YoY GROWTH",  f"{yoy_sign}{abs(yoy):.1f}%", f"{y_prev}→{y_last}"),
     ]:
         with col:
@@ -891,18 +944,19 @@ def main():
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    # ── Outlier info ─────────────────────────────────────────────────────────
+    # ── Outlier info ──────────────────────────────────────────────────────────
     if outlier_summary["n_outliers"] > 0:
         if remove_outliers:
-            st.markdown(f"""
-            <span class="clean-badge">✅ {outlier_summary['n_outliers']} outlier(s) detected and cleaned automatically</span>
-            """, unsafe_allow_html=True)
+            st.markdown(f'<span class="clean-badge">✅ {outlier_summary["n_outliers"]} '
+                        f'outlier(s) detected and cleaned automatically</span>',
+                        unsafe_allow_html=True)
         else:
-            st.markdown(f"""
-            <span class="outlier-badge">⚠️ {outlier_summary['n_outliers']} outlier(s) detected (cleaning disabled in sidebar)</span>
-            """, unsafe_allow_html=True)
+            st.markdown(f'<span class="outlier-badge">⚠️ {outlier_summary["n_outliers"]} '
+                        f'outlier(s) detected (cleaning disabled in sidebar)</span>',
+                        unsafe_allow_html=True)
     else:
-        st.markdown('<span class="clean-badge">✅ No outliers detected — data is clean</span>', unsafe_allow_html=True)
+        st.markdown('<span class="clean-badge">✅ No outliers detected — data is clean</span>',
+                    unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -919,12 +973,10 @@ def main():
 
     if not st.session_state.forecast_done:
         st.info("👆 Click **Run Forecast** to generate predictions.")
-        # Show outlier chart and seasonality always
-        if outlier_summary["n_outliers"] > 0 or True:
-            st.plotly_chart(
-                plot_outliers(raw_sales, cleaned_sales, outlier_flags, df_monthly["Date"]),
-                use_container_width=True,
-            )
+        st.plotly_chart(
+            plot_outliers(raw_sales, cleaned_sales, outlier_flags, df_monthly["Date"]),
+            use_container_width=True,
+        )
         return
 
     # ── Training ──────────────────────────────────────────────────────────────
@@ -959,11 +1011,11 @@ def main():
     ])
 
     with tab1:
-        st.markdown("<div class='section-header'>🔮 6-Month Forecast Results</div>", unsafe_allow_html=True)
+        st.markdown("<div class='section-header'>🔮 6-Month Forecast Results</div>",
+                    unsafe_allow_html=True)
 
-        # Forecast KPI cards
-        fc_arr = np.array(ens["forecast"])
-        total_fc = fc_arr.sum() / 1e7
+        fc_arr         = np.array(ens["forecast"])
+        total_fc       = fc_arr.sum() / 1e7
         best_month_idx = np.argmax(fc_arr)
         best_month_val = fc_arr[best_month_idx] / 1e7
         last_actual    = y[-1]
@@ -971,8 +1023,8 @@ def main():
 
         ka, kb, kc, kd = st.columns(4)
         for col, label, val, sub in [
-            (ka, "6M FORECAST TOTAL",   f"₹{total_fc:.1f} Cr", "ensemble"),
-            (kb, "MODEL ACCURACY",      f"{ens['mape']:.1f}%", "ensemble MAPE"),
+            (ka, "6M FORECAST TOTAL",   f"₹{total_fc:.1f} Cr",       "ensemble"),
+            (kb, "MODEL ACCURACY",      f"{ens['mape']:.1f}%",        "ensemble MAPE"),
             (kc, "PEAK FORECAST MONTH", f"₹{best_month_val:.1f} Cr", future_dates[best_month_idx].strftime("%b %Y")),
             (kd, "NEXT MONTH CHANGE",   f"{'+' if growth>0 else ''}{growth:.1f}%", "vs last actual"),
         ]:
@@ -1007,7 +1059,6 @@ def main():
             })
         st.dataframe(pd.DataFrame(fc_table), use_container_width=True, hide_index=True)
 
-        # Download
         excel_bytes = build_excel(
             df_forecast, ens, models, future_dates, metrics_df, lo, hi_ci, filter_label
         )
@@ -1034,8 +1085,8 @@ def main():
             for idx in outlier_summary["outlier_indices"]:
                 if idx < len(df_monthly):
                     ol_rows.append({
-                        "Month":      df_monthly.iloc[idx]["Date"].strftime("%b %Y"),
-                        "Raw (₹ Cr)": f"₹{raw_sales.iloc[idx]/1e7:.2f} Cr",
+                        "Month":          df_monthly.iloc[idx]["Date"].strftime("%b %Y"),
+                        "Raw (₹ Cr)":     f"₹{raw_sales.iloc[idx]/1e7:.2f} Cr",
                         "Cleaned (₹ Cr)": f"₹{cleaned_sales.iloc[idx]/1e7:.2f} Cr",
                     })
             st.dataframe(pd.DataFrame(ol_rows), use_container_width=True, hide_index=True)
@@ -1044,13 +1095,13 @@ def main():
         st.plotly_chart(plot_model_accuracy(all_models), use_container_width=True)
 
         st.markdown("**Model Weight in Ensemble (higher weight = better model):**")
-        weight_data = []
-        ens_weights = ens["params"].get("weights", [])
+        weight_data  = []
+        ens_weights  = ens["params"].get("weights", [])
         for m, w in zip(models, ens_weights):
             weight_data.append({
-                "Model":  m["name"],
-                "MAPE %": f"{m['mape']:.2f}%",
-                "Weight": f"{w:.3f}  ({w*100:.1f}%)",
+                "Model":       m["name"],
+                "MAPE %":      f"{m['mape']:.2f}%",
+                "Weight":      f"{w:.3f}  ({w*100:.1f}%)",
                 "Contribution": "⭐⭐⭐" if w == max(ens_weights) else ("⭐⭐" if w > 0.25 else "⭐"),
             })
         st.dataframe(pd.DataFrame(weight_data), use_container_width=True, hide_index=True)
@@ -1074,6 +1125,7 @@ def main():
         - **R²** — Coefficient of determination. Closer to 1.0 = better fit.
         - **MAE / RMSE** — Error in ₹ Crore (lower = better).
         """)
+
 
 if __name__ == "__main__":
     main()
