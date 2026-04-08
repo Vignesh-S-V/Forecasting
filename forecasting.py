@@ -6,16 +6,12 @@ import streamlit as st
 
 st.set_page_config(page_title="Forecasting App", layout="wide")
 
-
 # =========================================================
 # HELPERS
 # =========================================================
-def normalize_text(val):
-    if pd.isna(val):
-        return ""
-    return str(val).strip()
 
-
+# OPTIMIZATION 1: Cache the file reading so it doesn't reload on every interaction
+@st.cache_data
 def safe_read_file(uploaded_file):
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
@@ -23,7 +19,6 @@ def safe_read_file(uploaded_file):
     if name.endswith(".xlsx") or name.endswith(".xls"):
         return pd.read_excel(uploaded_file)
     raise ValueError("Unsupported file type. Please upload CSV or Excel.")
-
 
 def detect_product_column(df):
     possible_product_cols = [
@@ -34,7 +29,6 @@ def detect_product_column(df):
             return c
     return None
 
-
 def detect_qty_column(df):
     possible_qty_cols = [
         "Qty", "Quantity", "Sales", "Demand", "Forecast Qty", "Value", "Order Qty"
@@ -44,7 +38,6 @@ def detect_qty_column(df):
             return c
     return None
 
-
 def detect_date_column(df):
     possible_date_cols = [
         "Date", "Month", "Invoice Date", "Order Date", "Period", "Sales Date"
@@ -53,7 +46,6 @@ def detect_date_column(df):
         if c in df.columns:
             return c
     return None
-
 
 def infer_frequency(series):
     s = pd.to_datetime(series, errors="coerce").dropna().sort_values()
@@ -75,7 +67,6 @@ def infer_frequency(series):
     if median_gap <= 100:
         return "QS"
     return "YS"
-
 
 def build_complete_series(product_df, date_col, qty_col, freq):
     temp = product_df.copy()
@@ -100,7 +91,6 @@ def build_complete_series(product_df, date_col, qty_col, freq):
 
     return merged
 
-
 def weighted_forecast(series, horizon):
     values = series.astype(float).tolist()
     if len(values) == 0:
@@ -114,7 +104,6 @@ def weighted_forecast(series, horizon):
 
     return [forecast_value] * horizon
 
-
 def simple_moving_average_forecast(series, horizon, window=3):
     values = series.astype(float).tolist()
     if len(values) == 0:
@@ -124,7 +113,6 @@ def simple_moving_average_forecast(series, horizon, window=3):
     avg = float(np.mean(values[-w:])) if w > 0 else 0.0
     avg = max(0.0, avg)
     return [avg] * horizon
-
 
 def linear_trend_forecast(series, horizon):
     y = series.astype(float).values
@@ -141,7 +129,6 @@ def linear_trend_forecast(series, horizon):
         val = intercept + slope * (len(y) + i - 1)
         preds.append(max(0.0, float(val)))
     return preds
-
 
 def choose_best_method(train_series, test_series):
     methods = {
@@ -175,7 +162,6 @@ def choose_best_method(train_series, test_series):
 
     return best_name, best_preds
 
-
 def calculate_metrics(actual, forecast):
     actual = np.array(actual, dtype=float)
     forecast = np.array(forecast, dtype=float)
@@ -199,7 +185,6 @@ def calculate_metrics(actual, forecast):
         "Accuracy": float(accuracy),
     }
 
-
 def generate_forecast(product_data, date_col, qty_col, horizon, freq):
     series_df = build_complete_series(product_data, date_col, qty_col, freq)
 
@@ -208,7 +193,6 @@ def generate_forecast(product_data, date_col, qty_col, horizon, freq):
 
     y = series_df[qty_col].astype(float)
 
-    # backtest split
     backtest_periods = min(3, max(1, len(y) // 4)) if len(y) >= 4 else 1
 
     if len(y) > backtest_periods:
@@ -226,7 +210,6 @@ def generate_forecast(product_data, date_col, qty_col, horizon, freq):
             "Accuracy": 100.0,
         }
 
-    # final fit on full data
     if best_method == "Weighted Average":
         future_preds = weighted_forecast(y, horizon)
     elif best_method == "Moving Average":
@@ -253,7 +236,6 @@ def generate_forecast(product_data, date_col, qty_col, horizon, freq):
 
     return forecast_df, metrics
 
-
 def to_excel_bytes(forecast_df, metrics_df):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -261,7 +243,6 @@ def to_excel_bytes(forecast_df, metrics_df):
         metrics_df.to_excel(writer, index=False, sheet_name="Metrics")
     output.seek(0)
     return output.getvalue()
-
 
 # =========================================================
 # MAIN
@@ -321,7 +302,10 @@ def main():
 
     working_df = df.copy()
 
-    working_df[product_col] = working_df[product_col].apply(normalize_text)
+    # OPTIMIZATION 2: Vectorized Text Normalization instead of .apply()
+    working_df[product_col] = working_df[product_col].astype(str).str.strip()
+    working_df.loc[working_df[product_col] == "nan", product_col] = ""
+    
     working_df[date_col] = pd.to_datetime(working_df[date_col], errors="coerce")
     working_df[qty_col] = pd.to_numeric(working_df[qty_col], errors="coerce").fillna(0)
 
@@ -349,10 +333,8 @@ def main():
 
     if selected_product == "All Products":
         filtered_df = working_df.copy()
-        products_to_run = sorted(filtered_df[product_col].dropna().unique().tolist())
     else:
         filtered_df = working_df[working_df[product_col] == selected_product].copy()
-        products_to_run = [selected_product]
 
     if filtered_df.empty:
         st.warning("No data available for selected product.")
@@ -370,13 +352,16 @@ def main():
     metrics_list = []
 
     progress = st.progress(0)
-    total_products = max(1, len(products_to_run))
+    
+    # OPTIMIZATION 3: GroupBy instead of manual filtering in the loop
+    grouped_products = filtered_df.groupby(product_col)
+    total_products = len(grouped_products)
+    
+    # OPTIMIZATION 4: Throttle UI updates (update progress bar only 20 times max)
+    update_interval = max(1, total_products // 20)
 
-    for idx, current_product in enumerate(products_to_run, start=1):
-        product_data = filtered_df[filtered_df[product_col] == current_product].copy()
-
+    for idx, (current_product, product_data) in enumerate(grouped_products, start=1):
         if product_data.empty:
-            progress.progress(min(idx / total_products, 1.0))
             continue
 
         forecast_df_product, metrics_row = generate_forecast(
@@ -397,7 +382,9 @@ def main():
             metrics_row[product_col] = current_product
             metrics_list.append(metrics_row)
 
-        progress.progress(min(idx / total_products, 1.0))
+        # Update progress bar efficiently
+        if idx % update_interval == 0 or idx == total_products:
+            progress.progress(min(idx / total_products, 1.0))
 
     final_forecast_df = pd.concat(forecast_list, ignore_index=True) if forecast_list else pd.DataFrame()
     metrics_df = pd.DataFrame(metrics_list) if metrics_list else pd.DataFrame()
@@ -406,7 +393,6 @@ def main():
         st.warning("No forecast could be generated.")
         return
 
-    # reorder columns
     forecast_cols = [product_col, date_col, "Forecast_Qty"]
     forecast_cols = [c for c in forecast_cols if c in final_forecast_df.columns]
     final_forecast_df = final_forecast_df[forecast_cols]
@@ -459,7 +445,6 @@ def main():
             file_name="forecast_output.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-
 
 if __name__ == "__main__":
     main()
