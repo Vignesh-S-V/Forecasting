@@ -1,450 +1,1131 @@
+import warnings
+warnings.filterwarnings("ignore")
+
 import io
-import math
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+from scipy import stats
+from scipy.optimize import minimize
 import streamlit as st
 
-st.set_page_config(page_title="Forecasting App", layout="wide")
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
 
-# =========================================================
-# HELPERS
-# =========================================================
+st.set_page_config(
+    page_title="Textile Sales Forecasting",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# OPTIMIZATION 1: Cache the file reading so it doesn't reload on every interaction
-@st.cache_data
-def safe_read_file(uploaded_file):
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
-    raise ValueError("Unsupported file type. Please upload CSV or Excel.")
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM CSS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def detect_product_column(df):
-    possible_product_cols = [
-        "Product", "Product Name", "Item", "SKU", "Material", "Style", "Code"
-    ]
-    for c in possible_product_cols:
-        if c in df.columns:
-            return c
-    return None
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
 
-def detect_qty_column(df):
-    possible_qty_cols = [
-        "Qty", "Quantity", "Sales", "Demand", "Forecast Qty", "Value", "Order Qty"
-    ]
-    for c in possible_qty_cols:
-        if c in df.columns:
-            return c
-    return None
+html, body, [class*="css"] {
+    font-family: 'Space Grotesk', sans-serif;
+}
 
-def detect_date_column(df):
-    possible_date_cols = [
-        "Date", "Month", "Invoice Date", "Order Date", "Period", "Sales Date"
-    ]
-    for c in possible_date_cols:
-        if c in df.columns:
-            return c
-    return None
+/* Main background */
+.stApp {
+    background: linear-gradient(135deg, #0f0c29, #1a1a4e, #0f0c29);
+    color: #e8e8f0;
+}
 
-def infer_frequency(series):
-    s = pd.to_datetime(series, errors="coerce").dropna().sort_values()
-    if len(s) < 3:
-        return "MS"
+/* Sidebar */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #13103a 0%, #1e1a5e 100%);
+    border-right: 1px solid rgba(255,255,255,0.08);
+}
+[data-testid="stSidebar"] * { color: #d4d4f0 !important; }
 
-    diffs = s.diff().dropna().dt.days
-    if diffs.empty:
-        return "MS"
+/* Cards */
+.metric-card {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 16px;
+    padding: 20px 24px;
+    backdrop-filter: blur(10px);
+    transition: all 0.3s ease;
+}
+.metric-card:hover {
+    border-color: rgba(120,100,255,0.4);
+    background: rgba(255,255,255,0.08);
+}
+.metric-label {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: #8888cc;
+    margin-bottom: 8px;
+}
+.metric-value {
+    font-size: 28px;
+    font-weight: 700;
+    color: #ffffff;
+    font-family: 'JetBrains Mono', monospace;
+}
+.metric-sub {
+    font-size: 12px;
+    color: #6666aa;
+    margin-top: 4px;
+}
 
-    median_gap = diffs.median()
+/* Section headers */
+.section-header {
+    font-size: 20px;
+    font-weight: 700;
+    color: #a09cf7;
+    border-left: 4px solid #7c6fee;
+    padding-left: 14px;
+    margin: 28px 0 18px 0;
+    letter-spacing: 0.5px;
+}
 
-    if median_gap <= 2:
-        return "D"
-    if median_gap <= 10:
-        return "W"
-    if median_gap <= 35:
-        return "MS"
-    if median_gap <= 100:
-        return "QS"
-    return "YS"
+/* Forecast table */
+.forecast-table {
+    background: rgba(255,255,255,0.04);
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid rgba(255,255,255,0.08);
+}
 
-def build_complete_series(product_df, date_col, qty_col, freq):
-    temp = product_df.copy()
-    temp[date_col] = pd.to_datetime(temp[date_col], errors="coerce")
-    temp[qty_col] = pd.to_numeric(temp[qty_col], errors="coerce").fillna(0)
+/* Upload area override */
+[data-testid="stFileUploader"] {
+    background: rgba(120,100,255,0.08) !important;
+    border: 2px dashed rgba(120,100,255,0.4) !important;
+    border-radius: 14px !important;
+    padding: 20px !important;
+}
 
-    temp = temp.dropna(subset=[date_col])
-    temp = temp.groupby(date_col, as_index=False)[qty_col].sum()
-    temp = temp.sort_values(date_col)
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #7c6fee, #9b8cf5) !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 10px !important;
+    font-weight: 600 !important;
+    font-size: 15px !important;
+    padding: 10px 28px !important;
+    transition: all 0.3s ease !important;
+    font-family: 'Space Grotesk', sans-serif !important;
+}
+.stButton > button:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(124,111,238,0.5) !important;
+}
 
-    if temp.empty:
-        return temp
+/* Select box */
+.stSelectbox [data-baseweb="select"] {
+    background: rgba(255,255,255,0.06) !important;
+    border-color: rgba(255,255,255,0.15) !important;
+    border-radius: 10px !important;
+}
 
-    min_date = temp[date_col].min()
-    max_date = temp[date_col].max()
+/* Info / warning boxes */
+.stAlert {
+    border-radius: 12px !important;
+    border: none !important;
+}
 
-    full_index = pd.date_range(start=min_date, end=max_date, freq=freq)
-    full_df = pd.DataFrame({date_col: full_index})
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    background: rgba(255,255,255,0.04) !important;
+    border-radius: 12px !important;
+    gap: 4px;
+    padding: 4px;
+}
+.stTabs [data-baseweb="tab"] {
+    border-radius: 9px !important;
+    color: #9999cc !important;
+    font-weight: 600 !important;
+}
+.stTabs [aria-selected="true"] {
+    background: rgba(124,111,238,0.35) !important;
+    color: #ffffff !important;
+}
 
-    merged = full_df.merge(temp, on=date_col, how="left")
-    merged[qty_col] = merged[qty_col].fillna(0)
+/* Outlier badge */
+.outlier-badge {
+    display: inline-block;
+    background: rgba(255,80,80,0.2);
+    border: 1px solid rgba(255,80,80,0.4);
+    color: #ff8080;
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.clean-badge {
+    display: inline-block;
+    background: rgba(80,200,120,0.2);
+    border: 1px solid rgba(80,200,120,0.4);
+    color: #60d080;
+    border-radius: 8px;
+    padding: 3px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    return merged
+# ─────────────────────────────────────────────────────────────────────────────
+# PLOTLY THEME
+# ─────────────────────────────────────────────────────────────────────────────
 
-def weighted_forecast(series, horizon):
-    values = series.astype(float).tolist()
-    if len(values) == 0:
-        return [0.0] * horizon
+PLOTLY_THEME = dict(
+    template="plotly_dark",
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(255,255,255,0.03)",
+    font=dict(family="Space Grotesk", color="#d4d4f0"),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.06)", showgrid=True),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.06)", showgrid=True),
+    margin=dict(l=60, r=40, t=60, b=50),
+)
 
-    recent = values[-6:] if len(values) >= 6 else values[:]
-    n = len(recent)
-    weights = np.arange(1, n + 1, dtype=float)
-    forecast_value = float(np.dot(recent, weights) / weights.sum()) if weights.sum() > 0 else 0.0
-    forecast_value = max(0.0, forecast_value)
+ACCENT = ["#7c6fee", "#f5a623", "#50d090", "#e05cf5", "#f55050"]
 
-    return [forecast_value] * horizon
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — DATA LOADING
+# ─────────────────────────────────────────────────────────────────────────────
 
-def simple_moving_average_forecast(series, horizon, window=3):
-    values = series.astype(float).tolist()
-    if len(values) == 0:
-        return [0.0] * horizon
+@st.cache_data(show_spinner=False)
+def load_excel(file_bytes):
+    df = pd.read_excel(io.BytesIO(file_bytes))
+    return df
 
-    w = min(window, len(values))
-    avg = float(np.mean(values[-w:])) if w > 0 else 0.0
-    avg = max(0.0, avg)
-    return [avg] * horizon
 
-def linear_trend_forecast(series, horizon):
-    y = series.astype(float).values
-    if len(y) == 0:
-        return [0.0] * horizon
-    if len(y) == 1:
-        return [max(0.0, float(y[0]))] * horizon
+def find_columns(df):
+    """
+    Auto-detect Date / Sales / SUBGRP columns (case-insensitive).
+    FIX: Ensures only ONE column maps to each target name,
+         preventing duplicate column names which cause df[col]
+         to return a DataFrame instead of a Series.
+    """
+    col_map = {}
+    already_mapped = set()  # Track which target names are already assigned
 
-    x = np.arange(len(y))
-    slope, intercept = np.polyfit(x, y, 1)
+    for c in df.columns:
+        cl = str(c).strip().lower()
 
-    preds = []
-    for i in range(1, horizon + 1):
-        val = intercept + slope * (len(y) + i - 1)
-        preds.append(max(0.0, float(val)))
-    return preds
+        if cl == "date" and "Date" not in already_mapped:
+            col_map[c] = "Date"
+            already_mapped.add("Date")
 
-def choose_best_method(train_series, test_series):
-    methods = {
-        "Weighted Average": weighted_forecast,
-        "Moving Average": simple_moving_average_forecast,
-        "Linear Trend": linear_trend_forecast,
+        elif cl in ("cy value", "cyvalue", "cy_value", "sales", "value", "amount") \
+                and "Sales" not in already_mapped:
+            col_map[c] = "Sales"
+            already_mapped.add("Sales")
+
+        elif cl in ("subgrp", "sub_grp", "sub grp", "productname",
+                    "product_name", "product name", "product", "category") \
+                and "SUBGRP" not in already_mapped:
+            col_map[c] = "SUBGRP"
+            already_mapped.add("SUBGRP")
+
+    return col_map
+
+
+def safe_get_series(df, col_name):
+    """
+    Safely retrieve a column as a Series.
+    If df[col_name] returns a DataFrame (due to duplicate column names),
+    take only the first column to avoid .unique() / .dropna() failures.
+    """
+    result = df[col_name]
+    if isinstance(result, pd.DataFrame):
+        result = result.iloc[:, 0]
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — OUTLIER DETECTION & CLEANING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def detect_and_clean_outliers(monthly_series: pd.Series, method="iqr_mad"):
+    """
+    Detect outliers in monthly aggregated sales using IQR + MAD combo.
+    Replace outliers with interpolated values.
+
+    Returns:
+        cleaned   : pd.Series — cleaned values
+        flags     : np.array  — True where outlier was found
+        summary   : dict
+    """
+    y = monthly_series.values.astype(float)
+    n = len(y)
+
+    # IQR method
+    q1, q3 = np.percentile(y, 25), np.percentile(y, 75)
+    iqr = q3 - q1
+    iqr_lo = q1 - 2.5 * iqr
+    iqr_hi = q3 + 2.5 * iqr
+
+    # MAD method
+    median = np.median(y)
+    mad    = np.median(np.abs(y - median))
+    mad_lo = median - 3.5 * 1.4826 * mad
+    mad_hi = median + 3.5 * 1.4826 * mad
+
+    # Z-score method
+    mu, sigma = y.mean(), y.std()
+    z_lo = mu - 3.5 * sigma
+    z_hi = mu + 3.5 * sigma
+
+    # Combined flag: flagged by at least 2 of 3 methods
+    flag_iqr = (y < iqr_lo) | (y > iqr_hi)
+    flag_mad = (y < mad_lo) | (y > mad_hi)
+    flag_z   = (y < z_lo)   | (y > z_hi)
+    flags    = (flag_iqr.astype(int) + flag_mad.astype(int) + flag_z.astype(int)) >= 2
+
+    # Clean: replace outliers with linear interpolation
+    y_clean = y.copy()
+    for i in np.where(flags)[0]:
+        left  = next((j for j in range(i-1, -1, -1) if not flags[j]), None)
+        right = next((j for j in range(i+1, n)       if not flags[j]), None)
+        if left is not None and right is not None:
+            t = (i - left) / (right - left)
+            y_clean[i] = y[left] * (1 - t) + y[right] * t
+        elif left is not None:
+            y_clean[i] = y[left]
+        elif right is not None:
+            y_clean[i] = y[right]
+
+    summary = {
+        "n_outliers"     : int(flags.sum()),
+        "outlier_indices": list(np.where(flags)[0]),
+        "iqr_bounds"     : (iqr_lo, iqr_hi),
+        "mad_bounds"     : (mad_lo, mad_hi),
     }
 
-    best_name = None
-    best_preds = None
-    best_mape = np.inf
+    cleaned_series = pd.Series(y_clean, index=monthly_series.index)
+    return cleaned_series, flags, summary
 
-    horizon = len(test_series)
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — MODELS
+# ─────────────────────────────────────────────────────────────────────────────
 
-    for name, func in methods.items():
-        preds = func(train_series, horizon)
-        preds = np.array(preds, dtype=float)
-        actual = np.array(test_series, dtype=float)
+def holt_winters(series, season_len=12, forecast_periods=6):
+    y = np.array(series, dtype=float)
+    n = len(y)
 
-        with np.errstate(divide="ignore", invalid="ignore"):
-            ape = np.where(actual == 0, np.nan, np.abs((actual - preds) / actual) * 100)
+    def ets_sse(params):
+        alpha, beta, gamma = params
+        if not (0 < alpha < 1 and 0 < beta < 1 and 0 < gamma < 1):
+            return 1e15
+        L = np.mean(y[:season_len])
+        T = (np.mean(y[season_len:2*season_len]) - np.mean(y[:season_len])) / season_len if n >= 2*season_len else 0
+        S = [y[i] - L for i in range(season_len)]
+        fitted = []
+        L_prev, T_prev = L, T
+        for t in range(n):
+            s_idx = t % season_len
+            F = (L_prev + T_prev + S[s_idx]) if t > 0 else (L + T + S[s_idx])
+            fitted.append(F)
+            L_new = alpha * (y[t] - S[s_idx]) + (1 - alpha) * (L + T)
+            T_new = beta  * (L_new - L)        + (1 - beta)  * T
+            S[s_idx] = gamma * (y[t] - L_new) + (1 - gamma) * S[s_idx]
+            L_prev, T_prev = L, T
+            L, T = L_new, T_new
+        return np.sum((y - np.array(fitted)) ** 2)
 
-        mape = np.nanmean(ape)
-        if np.isnan(mape):
-            mape = 999999
+    res = minimize(ets_sse, [0.3, 0.1, 0.3], method="Nelder-Mead",
+                   options={"maxiter": 10000, "xatol": 1e-6})
+    alpha, beta, gamma = np.clip(res.x, 0.01, 0.99)
 
-        if mape < best_mape:
-            best_mape = mape
-            best_name = name
-            best_preds = preds
+    L = np.mean(y[:season_len])
+    T = (np.mean(y[season_len:2*season_len]) - np.mean(y[:season_len])) / season_len if n >= 2*season_len else 0
+    S = [y[i] - L for i in range(season_len)]
+    fitted = []
+    for t in range(n):
+        s_idx = t % season_len
+        fitted.append(L + T + S[s_idx])
+        L_new = alpha * (y[t] - S[s_idx]) + (1 - alpha) * (L + T)
+        T_new = beta  * (L_new - L)        + (1 - beta)  * T
+        S[s_idx] = gamma * (y[t] - L_new) + (1 - gamma) * S[s_idx]
+        L, T = L_new, T_new
 
-    return best_name, best_preds
+    forecast = []
+    for h in range(1, forecast_periods + 1):
+        s_idx = (n + h - 1) % season_len
+        forecast.append(max(L + h * T + S[s_idx], 0))
 
-def calculate_metrics(actual, forecast):
-    actual = np.array(actual, dtype=float)
-    forecast = np.array(forecast, dtype=float)
+    mape = np.mean(np.abs((y - np.array(fitted)) / (y + 1e-9))) * 100
+    return {"name": "Holt-Winters ETS", "fitted": fitted, "forecast": forecast,
+            "mape": mape, "params": {"alpha": alpha, "beta": beta, "gamma": gamma}}
 
-    mae = np.mean(np.abs(actual - forecast)) if len(actual) > 0 else 0.0
-    rmse = np.sqrt(np.mean((actual - forecast) ** 2)) if len(actual) > 0 else 0.0
 
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ape = np.where(actual == 0, np.nan, np.abs((actual - forecast) / actual) * 100)
+def sarima_simple(series, forecast_periods=6, season=12):
+    y = np.array(series, dtype=float)
+    n = len(y)
+    if n < season + 3:
+        fc = [y[-(season - i % season)] if season - i % season <= n else y[-1]
+              for i in range(forecast_periods)]
+        return {"name": "SARIMA", "fitted": list(y), "forecast": fc,
+                "mape": 999, "params": {}}
 
-    mape = np.nanmean(ape)
-    if np.isnan(mape):
-        mape = 0.0
+    d1 = y[season:] - y[:-season]
+    d2 = np.diff(d1)
+    p  = min(2, len(d2) - 1)
+    if p < 1:
+        p = 1
 
-    accuracy = max(0.0, 100.0 - mape)
+    X, Y_ar = [], []
+    for i in range(p, len(d2)):
+        X.append(d2[i-p:i][::-1])
+        Y_ar.append(d2[i])
+    X, Y_ar = np.array(X), np.array(Y_ar)
+    XtX     = X.T @ X + 1e-6 * np.eye(p)
+    ar_coef = np.linalg.solve(XtX, X.T @ Y_ar)
 
-    return {
-        "MAE": float(mae),
-        "RMSE": float(rmse),
-        "MAPE": float(mape),
-        "Accuracy": float(accuracy),
-    }
+    d1_ext = list(d1)
+    y_ext  = list(y)
+    d2_ext = list(d2)
+    forecast = []
+    for _ in range(forecast_periods):
+        next_d2 = ar_coef @ np.array(d2_ext[-p:])[::-1]
+        d2_ext.append(next_d2)
+        next_d1 = d1_ext[-1] + next_d2
+        d1_ext.append(next_d1)
+        next_y  = y_ext[-season] + next_d1
+        y_ext.append(max(next_y, 0))
+        forecast.append(max(next_y, 0))
 
-def generate_forecast(product_data, date_col, qty_col, horizon, freq):
-    series_df = build_complete_series(product_data, date_col, qty_col, freq)
+    d2_fit, fitted = list(d2[:p]), list(y[:season + p])
+    for i in range(p, len(d2)):
+        d2_fit.append(ar_coef @ np.array(d2_fit[-p:])[::-1])
+    d1_fit = list(d1[:p])
+    for v in d2_fit[p:]:
+        d1_fit.append(d1_fit[-1] + v)
+    y_fit = list(y[:season])
+    for i, v in enumerate(d1_fit):
+        y_fit.append(y_fit[i] + v)
+    y_fit_arr = np.array(y_fit[:n])
+    if len(y_fit_arr) < n:
+        y_fit_arr = np.pad(y_fit_arr, (0, n - len(y_fit_arr)), "edge")
 
-    if series_df.empty:
-        return pd.DataFrame(), {}
+    mape = np.mean(np.abs((y - y_fit_arr) / (y + 1e-9))) * 100
+    return {"name": "SARIMA", "fitted": y_fit_arr.tolist(),
+            "forecast": forecast, "mape": mape, "params": {"ar": ar_coef.tolist()}}
 
-    y = series_df[qty_col].astype(float)
 
-    backtest_periods = min(3, max(1, len(y) // 4)) if len(y) >= 4 else 1
+def seasonal_linear(series, forecast_periods=6, season=12):
+    y = np.array(series, dtype=float)
+    n = len(y)
+    ma  = np.convolve(y, np.ones(season)/season, mode="valid")
+    pad = (n - len(ma)) // 2
+    trend = np.concatenate([np.full(pad, ma[0]), ma, np.full(n - pad - len(ma), ma[-1])])
+    detrended   = y - trend
+    months      = np.array([i % season for i in range(n)])
+    seas_idx    = np.array([detrended[months == m].mean() for m in range(season)])
+    seas_idx   -= seas_idx.mean()
+    seasonal    = np.array([seas_idx[i % season] for i in range(n)])
+    slope, intercept, *_ = stats.linregress(np.arange(n), y - seasonal)
+    fitted = np.maximum(intercept + slope * np.arange(n) + seasonal, 0)
+    mape   = np.mean(np.abs((y - fitted) / (y + 1e-9))) * 100
+    forecast = [max(intercept + slope * (n - 1 + h) + seas_idx[(n - 1 + h) % season], 0)
+                for h in range(1, forecast_periods + 1)]
+    return {"name": "Seasonal Decomp + Trend", "fitted": fitted.tolist(),
+            "forecast": forecast, "mape": mape,
+            "params": {"slope": slope, "intercept": intercept}}
 
-    if len(y) > backtest_periods:
-        train_series = y.iloc[:-backtest_periods]
-        test_series = y.iloc[-backtest_periods:]
 
-        best_method, backtest_preds = choose_best_method(train_series, test_series)
-        metrics = calculate_metrics(test_series.values, backtest_preds)
-    else:
-        best_method = "Weighted Average"
-        metrics = {
-            "MAE": 0.0,
-            "RMSE": 0.0,
-            "MAPE": 0.0,
-            "Accuracy": 100.0,
-        }
+def ml_poly_seasonal(series, forecast_periods=6, season=12):
+    y = np.array(series, dtype=float)
+    n = len(y)
 
-    if best_method == "Weighted Average":
-        future_preds = weighted_forecast(y, horizon)
-    elif best_method == "Moving Average":
-        future_preds = simple_moving_average_forecast(y, horizon, window=3)
-    else:
-        future_preds = linear_trend_forecast(y, horizon)
+    def build_feat(idx):
+        t = np.array(idx, dtype=float)
+        return np.column_stack([
+            np.ones_like(t), t, t**2,
+            np.sin(2*np.pi*t/season), np.cos(2*np.pi*t/season),
+            np.sin(4*np.pi*t/season), np.cos(4*np.pi*t/season),
+        ])
 
-    last_date = pd.to_datetime(series_df[date_col].max())
-    future_dates = pd.date_range(
-        start=last_date + pd.tseries.frequencies.to_offset(freq),
-        periods=horizon,
-        freq=freq
+    X    = build_feat(range(n))
+    lam  = 1e6
+    coef = np.linalg.solve(X.T @ X + lam * np.eye(X.shape[1]), X.T @ y)
+    fitted   = np.maximum(X @ coef, 0)
+    X_fut    = build_feat(range(n, n + forecast_periods))
+    forecast = np.maximum(X_fut @ coef, 0).tolist()
+    mape     = np.mean(np.abs((y - fitted) / (y + 1e-9))) * 100
+    return {"name": "ML Poly+Seasonal (Ridge)", "fitted": fitted.tolist(),
+            "forecast": forecast, "mape": mape, "params": {"coef": coef.tolist()}}
+
+
+def ensemble(models, forecast_periods=6):
+    mapes   = np.array([m["mape"] for m in models])
+    mapes   = np.clip(mapes, 0.01, None)
+    weights = (1 / mapes) / (1 / mapes).sum()
+    blend_fc = sum(w * np.array(m["forecast"]) for m, w in zip(models, weights))
+    blend_ft = sum(w * np.array(m["fitted"])   for m, w in zip(models, weights))
+    blend_mape = float(np.average(mapes, weights=weights))
+    return {"name": "⭐ Weighted Ensemble", "fitted": blend_ft.tolist(),
+            "forecast": blend_fc.tolist(), "mape": blend_mape,
+            "params": {"weights": weights.tolist()}}
+
+
+def confidence_intervals(forecast, residuals, alpha=0.10):
+    std = np.std(residuals)
+    z   = stats.norm.ppf(1 - alpha / 2)
+    lo  = [max(f - z * std * np.sqrt(h), 0) for h, f in enumerate(forecast, 1)]
+    hi  = [f + z * std * np.sqrt(h) for h, f in enumerate(forecast, 1)]
+    return lo, hi
+
+
+def compute_metrics(y_true, y_pred, name):
+    y_true = np.array(y_true, dtype=float)
+    y_pred = np.array(y_pred[:len(y_true)], dtype=float)
+    mae  = np.mean(np.abs(y_true - y_pred))
+    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-9))) * 100
+    r2   = 1 - np.sum((y_true-y_pred)**2) / (np.sum((y_true-np.mean(y_true))**2)+1e-9)
+    return {"Model": name, "MAE (₹ Cr)": mae/1e7, "RMSE (₹ Cr)": rmse/1e7,
+            "MAPE (%)": round(mape, 2), "R²": round(r2, 4)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — EXCEL EXPORT
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_excel(df, ens, all_models, future_dates, metrics_df, lo, hi, subgrp):
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    thin = Border(
+        left=Side(style="thin"), right=Side(style="thin"),
+        top=Side(style="thin"), bottom=Side(style="thin")
     )
 
-    forecast_df = pd.DataFrame({
-        date_col: future_dates,
-        "Forecast_Qty": np.round(future_preds, 2)
-    })
+    def hdr(cell, bg="1A2C5B"):
+        cell.font      = Font(bold=True, color="FFFFFF", size=11)
+        cell.fill      = PatternFill("solid", start_color=bg)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    metrics["Best_Method"] = best_method
-    metrics["History_Periods"] = int(len(y))
-    metrics["Last_Actual_Qty"] = float(y.iloc[-1]) if len(y) > 0 else 0.0
-    metrics["Avg_History_Qty"] = float(np.mean(y)) if len(y) > 0 else 0.0
+    # Sheet 1 — Forecast
+    ws1 = wb.active
+    ws1.title = "6-Month Forecast"
+    hdrs1 = ["Month", "Forecast (₹)", "Forecast (₹ Cr)",
+             "Lower 90% CI (₹)", "Upper 90% CI (₹)", "MoM Change %"]
+    for ci, h in enumerate(hdrs1, 1):
+        hdr(ws1.cell(1, ci, h))
+        ws1.column_dimensions[get_column_letter(ci)].width = 22
 
-    return forecast_df, metrics
+    fc_arr = np.array(ens["forecast"])
+    last_actual = df["Sales"].values[-1]
+    for i, (fd, fv, fl, fh_v) in enumerate(zip(future_dates, fc_arr, lo, hi)):
+        prev = fc_arr[i-1] if i > 0 else last_actual
+        mom  = (fv - prev) / (prev + 1e-9) * 100
+        row  = [pd.Timestamp(fd).strftime("%b %Y"), fv, fv/1e7, fl, fh_v, mom/100]
+        fmts = ["@", "#,##0", "#,##0.00", "#,##0", "#,##0", '+0.0%;-0.0%']
+        for ci, (val, fmt) in enumerate(zip(row, fmts), 1):
+            cell = ws1.cell(i+2, ci, val)
+            cell.number_format = fmt
+            cell.alignment     = Alignment(horizontal="right" if ci > 1 else "center")
+            cell.border        = thin
 
-def to_excel_bytes(forecast_df, metrics_df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        forecast_df.to_excel(writer, index=False, sheet_name="Forecast")
-        metrics_df.to_excel(writer, index=False, sheet_name="Metrics")
-    output.seek(0)
-    return output.getvalue()
+    # Sheet 2 — Historical
+    ws2 = wb.create_sheet("Historical Data")
+    hdrs2 = ["Month", "Actual (₹)", "Actual (₹ Cr)",
+             "Ensemble Fitted (₹)", "Residual (₹)", "MAPE Row %"]
+    for ci, h in enumerate(hdrs2, 1):
+        hdr(ws2.cell(1, ci, h), "0D7377")
+        ws2.column_dimensions[get_column_letter(ci)].width = 22
+    fitted = np.array(ens["fitted"])
+    for i, (date, actual) in enumerate(zip(df["Date"], df["Sales"])):
+        residual = actual - fitted[i]
+        mrow = abs(residual) / (actual + 1e-9) * 100
+        row  = [date.strftime("%b %Y"), actual, actual/1e7, fitted[i], residual, mrow]
+        fmts = ["@", "#,##0", "#,##0.00", "#,##0", "#,##0", "0.00"]
+        for ci, (val, fmt) in enumerate(zip(row, fmts), 1):
+            cell = ws2.cell(i+2, ci, val)
+            cell.number_format = fmt
+            cell.alignment = Alignment(horizontal="right" if ci > 1 else "center")
+            cell.border = thin
 
-# =========================================================
-# MAIN
-# =========================================================
+    # Sheet 3 — Metrics
+    ws3 = wb.create_sheet("Model Metrics")
+    for ci, h in enumerate(metrics_df.columns, 1):
+        hdr(ws3.cell(1, ci, h), "4A148C")
+        ws3.column_dimensions[get_column_letter(ci)].width = 24
+    for ri, row_data in enumerate(metrics_df.itertuples(index=False), 2):
+        for ci, val in enumerate(row_data, 1):
+            cell = ws3.cell(ri, ci, val)
+            if isinstance(val, float):
+                cell.number_format = "0.00"
+            cell.alignment = Alignment(horizontal="center")
+            cell.border = thin
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — CHARTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_main_forecast(df, models, ens, future_dates, lo, hi):
+    dates = df["Date"]
+    y_cr  = df["Sales"] / 1e7
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=dates, y=y_cr, mode="lines+markers", name="Actual Sales",
+        line=dict(color="#ffffff", width=2.5),
+        marker=dict(size=6, color="#ffffff"),
+    ))
+    for m, c in zip(models, ACCENT):
+        fig.add_trace(go.Scatter(
+            x=future_dates, y=np.array(m["forecast"])/1e7,
+            mode="lines+markers", name=f"{m['name']} (MAPE {m['mape']:.1f}%)",
+            line=dict(color=c, width=1.5, dash="dot"),
+            marker=dict(size=5), opacity=0.75,
+        ))
+    fig.add_trace(go.Scatter(
+        x=list(future_dates) + list(future_dates)[::-1],
+        y=list(np.array(hi)/1e7) + list(np.array(lo)/1e7)[::-1],
+        fill="toself", fillcolor="rgba(230,80,150,0.12)",
+        line=dict(color="rgba(255,255,255,0)"),
+        hoverinfo="skip", showlegend=True, name="90% CI",
+    ))
+    fig.add_trace(go.Scatter(
+        x=future_dates, y=np.array(ens["forecast"])/1e7,
+        mode="lines+markers", name=f"⭐ Ensemble (MAPE {ens['mape']:.1f}%)",
+        line=dict(color="#e650a0", width=3),
+        marker=dict(size=9, symbol="star"),
+    ))
+    fig.add_vline(x=str(df["Date"].max()), line_dash="dash",
+                  line_color="rgba(255,255,255,0.3)", line_width=1.5)
+
+    fig.update_layout(
+        title="📈 Sales Forecast — All Models",
+        xaxis_title="Month", yaxis_title="Sales (₹ Crore)",
+        legend=dict(orientation="h", yanchor="bottom", y=-0.25, x=0),
+        height=480,
+        **PLOTLY_THEME,
+    )
+    return fig
+
+
+def plot_outliers(df_monthly_raw, df_monthly_clean, flags, dates):
+    fig = go.Figure()
+    y_raw   = df_monthly_raw / 1e7
+    y_clean = df_monthly_clean / 1e7
+
+    fig.add_trace(go.Scatter(
+        x=dates, y=y_raw, mode="lines", name="Raw",
+        line=dict(color="rgba(150,150,200,0.5)", width=1.5, dash="dot"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=dates, y=y_clean, mode="lines+markers", name="Cleaned",
+        line=dict(color="#50d090", width=2.5),
+        marker=dict(size=5, color="#50d090"),
+    ))
+    ol_dates = [d for d, f in zip(dates, flags) if f]
+    ol_vals  = [v for v, f in zip(y_raw, flags) if f]
+    if ol_dates:
+        fig.add_trace(go.Scatter(
+            x=ol_dates, y=ol_vals, mode="markers", name="Outlier Detected",
+            marker=dict(size=12, color="#ff5050", symbol="x", line=dict(width=2, color="#ff8080")),
+        ))
+    fig.update_layout(
+        title="🔍 Outlier Detection & Data Cleaning",
+        xaxis_title="Month", yaxis_title="Sales (₹ Crore)",
+        height=380, **PLOTLY_THEME,
+    )
+    return fig
+
+
+def plot_seasonality_heatmap(df):
+    df2 = df.copy()
+    df2["Month"] = df2["Date"].dt.month
+    df2["Year"]  = df2["Date"].dt.year
+    df2["Sales_Cr"] = df2["Sales"] / 1e7
+    pivot = df2.pivot_table(values="Sales_Cr", index="Year", columns="Month", aggfunc="sum")
+    month_labels = ["Jan","Feb","Mar","Apr","May","Jun",
+                    "Jul","Aug","Sep","Oct","Nov","Dec"]
+    col_labels = [month_labels[c-1] for c in pivot.columns]
+
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values, x=col_labels, y=[str(y) for y in pivot.index],
+        colorscale="YlOrRd", text=np.round(pivot.values, 1),
+        texttemplate="₹%{text}Cr", textfont=dict(size=9),
+        hovertemplate="Year: %{y}<br>Month: %{x}<br>Sales: ₹%{z:.1f}Cr<extra></extra>",
+        colorbar=dict(title="₹ Cr"),
+    ))
+    fig.update_layout(
+        title="🗓️ Monthly Seasonality Heatmap (₹ Crore)",
+        height=320, **PLOTLY_THEME,
+    )
+    return fig
+
+
+def plot_model_accuracy(all_models):
+    names  = [m["name"].replace("⭐ ", "") for m in all_models]
+    mapes  = [m["mape"] for m in all_models]
+    colors = ACCENT + ["#e650a0"]
+    fig = go.Figure(go.Bar(
+        x=mapes, y=names, orientation="h",
+        marker=dict(color=colors[:len(names)], opacity=0.85),
+        text=[f"{v:.1f}%" for v in mapes], textposition="outside",
+    ))
+    fig.add_vline(x=5,  line_dash="dash", line_color="rgba(80,200,120,0.5)", annotation_text="Good (5%)")
+    fig.add_vline(x=10, line_dash="dash", line_color="rgba(245,166,35,0.5)", annotation_text="Fair (10%)")
+    fig.update_layout(
+        title="🎯 Model Accuracy (MAPE — lower is better)",
+        xaxis_title="MAPE %", height=340, **PLOTLY_THEME,
+    )
+    return fig
+
+
+def plot_detailed_forecast(df, ens, future_dates, lo, hi):
+    tail_dates  = df["Date"].values[-6:]
+    tail_actual = df["Sales"].values[-6:] / 1e7
+    fc_cr = np.array(ens["forecast"]) / 1e7
+    lo_cr = np.array(lo) / 1e7
+    hi_cr = np.array(hi) / 1e7
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=tail_dates, y=tail_actual, mode="lines+markers", name="Last 6M Actual",
+        line=dict(color="#aaaaee", width=2),
+        marker=dict(size=7, color="#aaaaee"),
+    ))
+    fig.add_trace(go.Scatter(
+        x=list(future_dates) + list(future_dates)[::-1],
+        y=list(hi_cr) + list(lo_cr)[::-1],
+        fill="toself", fillcolor="rgba(230,80,150,0.15)",
+        line=dict(color="rgba(0,0,0,0)"), name="90% CI", hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatter(
+        x=future_dates, y=fc_cr, mode="lines+markers+text",
+        name="⭐ Ensemble Forecast",
+        line=dict(color="#e650a0", width=3),
+        marker=dict(size=10, symbol="star", color="#e650a0"),
+        text=[f"₹{v:.1f}Cr" for v in fc_cr],
+        textposition="top center",
+        textfont=dict(size=11, color="#f080c0"),
+    ))
+    fig.update_layout(
+        title="📅 Next 6-Month Detailed Forecast with 90% Confidence Interval",
+        xaxis_title="Month", yaxis_title="Sales (₹ Crore)",
+        height=420, **PLOTLY_THEME,
+    )
+    return fig
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — STREAMLIT UI
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
-    st.title("Sales Forecasting App")
-    st.write("Upload your CSV / Excel file and generate product-wise forecast.")
+    # ── Header ───────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div style="text-align:center; padding: 20px 0 10px 0;">
+        <div style="font-size:42px; font-weight:800; background: linear-gradient(135deg,#a09cf7,#f5a623,#50d090);
+             -webkit-background-clip:text; -webkit-text-fill-color:transparent; letter-spacing:-1px;">
+            📈 Textile Sales Forecasting
+        </div>
+        <div style="color:#7777aa; font-size:15px; margin-top:8px; letter-spacing:1px;">
+            Upload → Filter by SUBGRP → Get 6-Month AI Forecast
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader(
-        "Upload file",
-        type=["csv", "xlsx", "xls"]
-    )
+    st.markdown("---")
 
-    if uploaded_file is None:
-        st.info("Please upload a file to continue.")
+    # ── Sidebar ───────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("### ⚙️ Settings")
+        st.markdown("---")
+
+        uploaded = st.file_uploader(
+            "📂 Upload Excel File",
+            type=["xlsx", "xls"],
+            help="File must have: Date, CY Value, SUBGRP columns",
+        )
+
+        subgrp_choice   = None
+        remove_outliers = True
+        forecast_periods = 6
+
+        if uploaded:
+            st.success("✅ File uploaded!")
+            try:
+                raw_df  = load_excel(uploaded.read())
+                col_map = find_columns(raw_df)
+                raw_df_renamed = raw_df.rename(columns=col_map).copy()
+
+                # ── FIX: handle duplicate column names ───────────────────
+                # After renaming, if there are still duplicate column names,
+                # keep only the FIRST occurrence of each target column.
+                seen = {}
+                new_cols = []
+                for col in raw_df_renamed.columns:
+                    if col not in seen:
+                        seen[col] = 0
+                        new_cols.append(col)
+                    else:
+                        seen[col] += 1
+                        new_cols.append(f"{col}__dup{seen[col]}")
+                raw_df_renamed.columns = new_cols
+                # ── END FIX ──────────────────────────────────────────────
+
+                if "SUBGRP" in raw_df_renamed.columns:
+                    # safe_get_series guards against any remaining DataFrame return
+                    subgrp_series = safe_get_series(raw_df_renamed, "SUBGRP")
+                    subgrps = sorted(subgrp_series.dropna().unique().tolist())
+                    subgrp_choice = st.selectbox(
+                        "🏷️ Filter by SUBGRP",
+                        options=["All Products"] + subgrps,
+                        index=0,
+                    )
+                else:
+                    st.warning("⚠️ No SUBGRP column found. Using all data.")
+
+                st.markdown("---")
+                remove_outliers  = st.toggle("🔍 Remove Outliers", value=True)
+                forecast_periods = st.slider("📅 Forecast Months", 3, 12, 6)
+
+                st.markdown("---")
+                st.markdown("**📋 File Info**")
+                st.markdown(f"- Rows: **{len(raw_df):,}**")
+                st.markdown(f"- Columns: **{list(raw_df.columns)}**")
+
+            except Exception as e:
+                st.error(f"❌ Error reading file: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+                return
+
+        st.markdown("---")
+        st.markdown("""
+        <div style="font-size:11px; color:#555588; text-align:center;">
+        Expected columns:<br>
+        <code>Date · CY Value · SUBGRP</code>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── Main Content ──────────────────────────────────────────────────────────
+    if uploaded is None:
+        col1, col2, col3 = st.columns(3)
+        for col, icon, title, desc in [
+            (col1, "📂", "Upload", "Upload your Excel file with Date, CY Value, SUBGRP columns"),
+            (col2, "🏷️", "Filter", "Select any SUBGRP product to forecast individually"),
+            (col3, "🔮", "Forecast", "Get 6-month predictions with 4 AI models + ensemble"),
+        ]:
+            with col:
+                st.markdown(f"""
+                <div class="metric-card" style="text-align:center; padding:32px 20px;">
+                    <div style="font-size:36px;">{icon}</div>
+                    <div style="font-size:18px; font-weight:700; color:#a09cf7; margin:12px 0 8px;">{title}</div>
+                    <div style="font-size:13px; color:#666699;">{desc}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.info("👈 Upload your Excel file from the sidebar to get started!")
         return
 
+    # ── Process data ──────────────────────────────────────────────────────────
     try:
-        df = safe_read_file(uploaded_file)
+        raw_df  = load_excel(uploaded.getvalue())
+        col_map = find_columns(raw_df)
+
+        if "Date" not in col_map.values():
+            st.error("❌ 'Date' column not found! Please check your file.")
+            return
+        if "Sales" not in col_map.values():
+            st.error("❌ 'CY Value' / 'Sales' column not found! Please check your file.")
+            return
+
+        df_work = raw_df.rename(columns=col_map).copy()
+
+        # ── FIX: deduplicate column names after rename ────────────────────
+        seen = {}
+        new_cols = []
+        for col in df_work.columns:
+            if col not in seen:
+                seen[col] = 0
+                new_cols.append(col)
+            else:
+                seen[col] += 1
+                new_cols.append(f"{col}__dup{seen[col]}")
+        df_work.columns = new_cols
+        # ── END FIX ──────────────────────────────────────────────────────
+
+        df_work["Date"]  = pd.to_datetime(safe_get_series(df_work, "Date"),  errors="coerce")
+        df_work["Sales"] = pd.to_numeric(safe_get_series(df_work, "Sales"), errors="coerce").fillna(0)
+        df_work = df_work.dropna(subset=["Date", "Sales"])
+
+        # Product filter
+        filter_label = "All Products"
+        if subgrp_choice and subgrp_choice != "All Products" and "SUBGRP" in df_work.columns:
+            subgrp_col = safe_get_series(df_work, "SUBGRP")
+            df_work = df_work[subgrp_col == subgrp_choice].copy()
+            filter_label = subgrp_choice
+
+        if len(df_work) == 0:
+            st.error("❌ No data after filtering!")
+            return
+
+        # Monthly aggregation
+        df_monthly = (df_work
+                      .groupby(df_work["Date"].dt.to_period("M"))["Sales"]
+                      .sum()
+                      .reset_index())
+        df_monthly["Date"] = df_monthly["Date"].dt.to_timestamp()
+        df_monthly = df_monthly.sort_values("Date").reset_index(drop=True)
+
+        if len(df_monthly) < 6:
+            st.error("❌ Not enough monthly data (minimum 6 months needed).")
+            return
+
+        # Outlier detection
+        raw_sales = df_monthly["Sales"].copy()
+        cleaned_sales, outlier_flags, outlier_summary = detect_and_clean_outliers(df_monthly["Sales"])
+
+        df_forecast = df_monthly.copy()
+        if remove_outliers:
+            df_forecast["Sales"] = cleaned_sales
+
     except Exception as e:
-        st.error(f"File reading error: {e}")
+        st.error(f"❌ Error processing data: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return
 
-    if df.empty:
-        st.error("Uploaded file is empty.")
-        return
+    # ── KPI Row ───────────────────────────────────────────────────────────────
+    st.markdown(f"<div class='section-header'>📊 Data Overview — {filter_label}</div>",
+                unsafe_allow_html=True)
 
-    st.subheader("Raw Data Preview")
-    st.dataframe(df.head(20), use_container_width=True)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    avg_cr   = df_forecast["Sales"].mean() / 1e7
+    peak_cr  = df_forecast["Sales"].max()  / 1e7
+    peak_m   = df_forecast.loc[df_forecast["Sales"].idxmax(), "Date"].strftime("%b %Y")
+    total_cr = df_forecast["Sales"].sum()  / 1e7
 
-    detected_date_col = detect_date_column(df)
-    detected_product_col = detect_product_column(df)
-    detected_qty_col = detect_qty_column(df)
+    df_forecast["Year"]  = df_forecast["Date"].dt.year
+    df_forecast["Month"] = df_forecast["Date"].dt.month
+    y_last = df_forecast["Year"].max()
+    y_prev = y_last - 1
+    s_last = df_forecast[df_forecast["Year"] == y_last]["Sales"].sum()
+    s_prev = df_forecast[df_forecast["Year"] == y_prev]["Sales"].sum()
+    yoy    = (s_last - s_prev) / (s_prev + 1e-9) * 100 if s_prev > 0 else 0
+    yoy_sign = "🔺" if yoy > 0 else "🔻"
 
-    col1, col2, col3 = st.columns(3)
+    period_str = (f"{df_monthly['Date'].min().strftime('%b %Y')} → "
+                  f"{df_monthly['Date'].max().strftime('%b %Y')}")
 
-    with col1:
-        date_col = st.selectbox(
-            "Select Date Column",
-            options=df.columns.tolist(),
-            index=df.columns.tolist().index(detected_date_col) if detected_date_col in df.columns else 0
-        )
+    for col, label, val, sub in [
+        (k1, "PERIOD",      period_str,              f"{len(df_monthly)} months"),
+        (k2, "AVG MONTHLY", f"₹{avg_cr:.1f} Cr",    "average"),
+        (k3, "PEAK MONTH",  f"₹{peak_cr:.1f} Cr",   peak_m),
+        (k4, "TOTAL",       f"₹{total_cr:.1f} Cr",  "all months"),
+        (k5, "YoY GROWTH",  f"{yoy_sign}{abs(yoy):.1f}%", f"{y_prev}→{y_last}"),
+    ]:
+        with col:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="metric-label">{label}</div>
+                <div class="metric-value" style="font-size:{'18px' if len(val)>8 else '24px'};">{val}</div>
+                <div class="metric-sub">{sub}</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-    with col2:
-        product_col = st.selectbox(
-            "Select Product Column",
-            options=df.columns.tolist(),
-            index=df.columns.tolist().index(detected_product_col) if detected_product_col in df.columns else 0
-        )
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    with col3:
-        qty_col = st.selectbox(
-            "Select Quantity / Demand Column",
-            options=df.columns.tolist(),
-            index=df.columns.tolist().index(detected_qty_col) if detected_qty_col in df.columns else 0
-        )
-
-    working_df = df.copy()
-
-    # OPTIMIZATION 2: Vectorized Text Normalization instead of .apply()
-    working_df[product_col] = working_df[product_col].astype(str).str.strip()
-    working_df.loc[working_df[product_col] == "nan", product_col] = ""
-    
-    working_df[date_col] = pd.to_datetime(working_df[date_col], errors="coerce")
-    working_df[qty_col] = pd.to_numeric(working_df[qty_col], errors="coerce").fillna(0)
-
-    working_df = working_df.dropna(subset=[date_col])
-    working_df = working_df[working_df[product_col] != ""]
-
-    if working_df.empty:
-        st.error("No valid records found after cleaning.")
-        return
-
-    freq = infer_frequency(working_df[date_col])
-
-    st.subheader("Forecast Settings")
-    c1, c2 = st.columns(2)
-
-    with c1:
-        horizon = st.slider("Forecast Periods", min_value=1, max_value=12, value=3)
-
-    with c2:
-        all_products = sorted(working_df[product_col].dropna().unique().tolist())
-        selected_product = st.selectbox(
-            "Select Product",
-            options=["All Products"] + all_products
-        )
-
-    if selected_product == "All Products":
-        filtered_df = working_df.copy()
+    # ── Outlier info ──────────────────────────────────────────────────────────
+    if outlier_summary["n_outliers"] > 0:
+        if remove_outliers:
+            st.markdown(f'<span class="clean-badge">✅ {outlier_summary["n_outliers"]} '
+                        f'outlier(s) detected and cleaned automatically</span>',
+                        unsafe_allow_html=True)
+        else:
+            st.markdown(f'<span class="outlier-badge">⚠️ {outlier_summary["n_outliers"]} '
+                        f'outlier(s) detected (cleaning disabled in sidebar)</span>',
+                        unsafe_allow_html=True)
     else:
-        filtered_df = working_df[working_df[product_col] == selected_product].copy()
+        st.markdown('<span class="clean-badge">✅ No outliers detected — data is clean</span>',
+                    unsafe_allow_html=True)
 
-    if filtered_df.empty:
-        st.warning("No data available for selected product.")
-        return
+    st.markdown("<br>", unsafe_allow_html=True)
 
-    st.subheader("Filtered Data Preview")
-    st.dataframe(filtered_df.head(20), use_container_width=True)
+    # ── Run Forecast Button ───────────────────────────────────────────────────
+    run_col, _ = st.columns([1, 3])
+    with run_col:
+        run_btn = st.button("🚀 Run Forecast", use_container_width=True)
 
-    run_forecast = st.button("Generate Forecast", type="primary")
+    if "forecast_done" not in st.session_state:
+        st.session_state.forecast_done = False
+    if run_btn:
+        st.session_state.forecast_done = True
+        st.session_state.forecast_key  = f"{filter_label}_{remove_outliers}_{forecast_periods}"
 
-    if not run_forecast:
-        return
-
-    forecast_list = []
-    metrics_list = []
-
-    progress = st.progress(0)
-    
-    # OPTIMIZATION 3: GroupBy instead of manual filtering in the loop
-    grouped_products = filtered_df.groupby(product_col)
-    total_products = len(grouped_products)
-    
-    # OPTIMIZATION 4: Throttle UI updates (update progress bar only 20 times max)
-    update_interval = max(1, total_products // 20)
-
-    for idx, (current_product, product_data) in enumerate(grouped_products, start=1):
-        if product_data.empty:
-            continue
-
-        forecast_df_product, metrics_row = generate_forecast(
-            product_data=product_data,
-            date_col=date_col,
-            qty_col=qty_col,
-            horizon=horizon,
-            freq=freq
+    if not st.session_state.forecast_done:
+        st.info("👆 Click **Run Forecast** to generate predictions.")
+        st.plotly_chart(
+            plot_outliers(raw_sales, cleaned_sales, outlier_flags, df_monthly["Date"]),
+            use_container_width=True,
         )
-
-        if not forecast_df_product.empty:
-            forecast_df_product = forecast_df_product.copy()
-            forecast_df_product[product_col] = current_product
-            forecast_list.append(forecast_df_product)
-
-        if metrics_row:
-            metrics_row = dict(metrics_row)
-            metrics_row[product_col] = current_product
-            metrics_list.append(metrics_row)
-
-        # Update progress bar efficiently
-        if idx % update_interval == 0 or idx == total_products:
-            progress.progress(min(idx / total_products, 1.0))
-
-    final_forecast_df = pd.concat(forecast_list, ignore_index=True) if forecast_list else pd.DataFrame()
-    metrics_df = pd.DataFrame(metrics_list) if metrics_list else pd.DataFrame()
-
-    if final_forecast_df.empty:
-        st.warning("No forecast could be generated.")
         return
 
-    forecast_cols = [product_col, date_col, "Forecast_Qty"]
-    forecast_cols = [c for c in forecast_cols if c in final_forecast_df.columns]
-    final_forecast_df = final_forecast_df[forecast_cols]
+    # ── Training ──────────────────────────────────────────────────────────────
+    y = df_forecast["Sales"].values
 
-    if not metrics_df.empty:
-        metric_order = [
-            product_col, "Best_Method", "History_Periods", "Last_Actual_Qty",
-            "Avg_History_Qty", "MAE", "RMSE", "MAPE", "Accuracy"
-        ]
-        metric_order = [c for c in metric_order if c in metrics_df.columns]
-        metrics_df = metrics_df[metric_order]
+    with st.spinner("🔧 Training 4 models + ensemble..."):
+        prog = st.progress(0)
+        m1 = holt_winters(y, season_len=min(12, len(y)//2), forecast_periods=forecast_periods)
+        prog.progress(25)
+        m2 = sarima_simple(y, forecast_periods=forecast_periods)
+        prog.progress(50)
+        m3 = seasonal_linear(y, forecast_periods=forecast_periods)
+        prog.progress(75)
+        m4 = ml_poly_seasonal(y, forecast_periods=forecast_periods)
+        prog.progress(100)
 
-    st.success("Forecast generated successfully.")
+    models = [m1, m2, m3, m4]
+    ens    = ensemble(models, forecast_periods=forecast_periods)
 
-    st.subheader("Forecast Output")
-    display_forecast_df = final_forecast_df.copy()
-    for col in display_forecast_df.columns:
-        if pd.api.types.is_numeric_dtype(display_forecast_df[col]):
-            display_forecast_df[col] = pd.to_numeric(display_forecast_df[col], errors="coerce").round(2)
+    last_date    = df_forecast["Date"].max()
+    future_dates = pd.date_range(start=last_date + pd.offsets.MonthBegin(1),
+                                 periods=forecast_periods, freq="MS")
+    residuals    = np.array(y) - np.array(ens["fitted"])
+    lo, hi_ci    = confidence_intervals(np.array(ens["forecast"]), residuals)
+    all_models   = models + [ens]
+    metrics_rows = [compute_metrics(y, m["fitted"], m["name"]) for m in all_models]
+    metrics_df   = pd.DataFrame(metrics_rows)
 
-    st.dataframe(display_forecast_df, use_container_width=True, hide_index=True)
+    # ── Tabs ──────────────────────────────────────────────────────────────────
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🔮 Forecast", "📊 Data Quality", "🎯 Model Accuracy", "📋 Metrics Table"
+    ])
 
-    st.subheader("Forecast Metrics")
-    if not metrics_df.empty:
-        display_metrics_df = metrics_df.copy()
-        for col in display_metrics_df.columns:
-            if pd.api.types.is_numeric_dtype(display_metrics_df[col]):
-                display_metrics_df[col] = pd.to_numeric(display_metrics_df[col], errors="coerce").round(2)
+    with tab1:
+        st.markdown("<div class='section-header'>🔮 6-Month Forecast Results</div>",
+                    unsafe_allow_html=True)
 
-        st.dataframe(display_metrics_df, use_container_width=True, hide_index=True)
-    else:
-        st.info("No metrics available.")
+        fc_arr         = np.array(ens["forecast"])
+        total_fc       = fc_arr.sum() / 1e7
+        best_month_idx = np.argmax(fc_arr)
+        best_month_val = fc_arr[best_month_idx] / 1e7
+        last_actual    = y[-1]
+        growth = (fc_arr[0] - last_actual) / (last_actual + 1e-9) * 100
 
-    csv_bytes = final_forecast_df.to_csv(index=False).encode("utf-8")
-    excel_bytes = to_excel_bytes(final_forecast_df, metrics_df)
+        ka, kb, kc, kd = st.columns(4)
+        for col, label, val, sub in [
+            (ka, "6M FORECAST TOTAL",   f"₹{total_fc:.1f} Cr",       "ensemble"),
+            (kb, "MODEL ACCURACY",      f"{ens['mape']:.1f}%",        "ensemble MAPE"),
+            (kc, "PEAK FORECAST MONTH", f"₹{best_month_val:.1f} Cr", future_dates[best_month_idx].strftime("%b %Y")),
+            (kd, "NEXT MONTH CHANGE",   f"{'+' if growth>0 else ''}{growth:.1f}%", "vs last actual"),
+        ]:
+            with col:
+                color = "#50d090" if label == "MODEL ACCURACY" and ens["mape"] < 10 else "#a09cf7"
+                st.markdown(f"""
+                <div class="metric-card">
+                    <div class="metric-label">{label}</div>
+                    <div class="metric-value" style="color:{color};">{val}</div>
+                    <div class="metric-sub">{sub}</div>
+                </div>
+                """, unsafe_allow_html=True)
 
-    d1, d2 = st.columns(2)
-    with d1:
-        st.download_button(
-            label="Download Forecast CSV",
-            data=csv_bytes,
-            file_name="forecast_output.csv",
-            mime="text/csv"
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.plotly_chart(plot_main_forecast(df_forecast, models, ens, future_dates, lo, hi_ci),
+                        use_container_width=True)
+        st.plotly_chart(plot_detailed_forecast(df_forecast, ens, future_dates, lo, hi_ci),
+                        use_container_width=True)
+
+        # Forecast table
+        st.markdown("<div class='section-header'>📋 Forecast Table</div>", unsafe_allow_html=True)
+        fc_table = []
+        for i, (fd, fv, fl, fh_v) in enumerate(zip(future_dates, fc_arr, lo, hi_ci)):
+            prev = fc_arr[i-1] if i > 0 else last_actual
+            mom  = (fv - prev) / (prev + 1e-9) * 100
+            fc_table.append({
+                "Month":           fd.strftime("%b %Y"),
+                "Forecast (₹ Cr)": f"₹{fv/1e7:.2f} Cr",
+                "Lower CI (₹ Cr)": f"₹{fl/1e7:.1f} Cr",
+                "Upper CI (₹ Cr)": f"₹{fh_v/1e7:.1f} Cr",
+                "MoM Change":      f"{'🔺' if mom>0 else '🔻'} {mom:+.1f}%",
+            })
+        st.dataframe(pd.DataFrame(fc_table), use_container_width=True, hide_index=True)
+
+        excel_bytes = build_excel(
+            df_forecast, ens, models, future_dates, metrics_df, lo, hi_ci, filter_label
         )
-
-    with d2:
         st.download_button(
-            label="Download Forecast + Metrics Excel",
+            "⬇️ Download Full Results (Excel)",
             data=excel_bytes,
-            file_name="forecast_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            file_name=f"forecast_{filter_label.replace(' ','_')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
         )
+
+    with tab2:
+        st.markdown("<div class='section-header'>🔍 Data Quality & Outlier Analysis</div>",
+                    unsafe_allow_html=True)
+        st.plotly_chart(
+            plot_outliers(raw_sales, cleaned_sales, outlier_flags, df_monthly["Date"]),
+            use_container_width=True,
+        )
+        st.plotly_chart(plot_seasonality_heatmap(df_forecast), use_container_width=True)
+
+        if outlier_summary["n_outliers"] > 0:
+            st.markdown("**Outlier Details:**")
+            ol_rows = []
+            for idx in outlier_summary["outlier_indices"]:
+                if idx < len(df_monthly):
+                    ol_rows.append({
+                        "Month":          df_monthly.iloc[idx]["Date"].strftime("%b %Y"),
+                        "Raw (₹ Cr)":     f"₹{raw_sales.iloc[idx]/1e7:.2f} Cr",
+                        "Cleaned (₹ Cr)": f"₹{cleaned_sales.iloc[idx]/1e7:.2f} Cr",
+                    })
+            st.dataframe(pd.DataFrame(ol_rows), use_container_width=True, hide_index=True)
+
+    with tab3:
+        st.plotly_chart(plot_model_accuracy(all_models), use_container_width=True)
+
+        st.markdown("**Model Weight in Ensemble (higher weight = better model):**")
+        weight_data  = []
+        ens_weights  = ens["params"].get("weights", [])
+        for m, w in zip(models, ens_weights):
+            weight_data.append({
+                "Model":       m["name"],
+                "MAPE %":      f"{m['mape']:.2f}%",
+                "Weight":      f"{w:.3f}  ({w*100:.1f}%)",
+                "Contribution": "⭐⭐⭐" if w == max(ens_weights) else ("⭐⭐" if w > 0.25 else "⭐"),
+            })
+        st.dataframe(pd.DataFrame(weight_data), use_container_width=True, hide_index=True)
+
+    with tab4:
+        st.markdown("<div class='section-header'>📋 Full Model Performance Metrics</div>",
+                    unsafe_allow_html=True)
+        st.dataframe(
+            metrics_df.style.format({
+                "MAE (₹ Cr)":  "{:.2f}",
+                "RMSE (₹ Cr)": "{:.2f}",
+                "MAPE (%)":    "{:.2f}",
+                "R²":          "{:.4f}",
+            }).background_gradient(subset=["MAPE (%)"], cmap="RdYlGn_r"),
+            use_container_width=True, hide_index=True,
+        )
+
+        st.markdown("""
+        **Metric Guide:**
+        - **MAPE** — Mean Absolute Percentage Error. Lower = better. <5% = Excellent, 5–10% = Good, >15% = Poor.
+        - **R²** — Coefficient of determination. Closer to 1.0 = better fit.
+        - **MAE / RMSE** — Error in ₹ Crore (lower = better).
+        """)
+
 
 if __name__ == "__main__":
     main()
